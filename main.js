@@ -8,49 +8,43 @@ class EvertzVIPXInstance extends InstanceBase {
   constructor(internal) {
     super(internal)
 
-    // state for dynamic choices
+    // protocol/connection state
     this._connected = false
+    this._handshook = false
     this._ifaceVersion = undefined
 
+    // caches for dynamic choices
     this._displays = []
     this._layouts = []
-    this._windows = {} // keyed by displayId -> [{id,name}]
-    this._inputs  = {} // keyed by displayId -> [{id,name}]
+    this._windows = {} // displayId -> [{id,name}]
+    this._inputs = {} // displayId -> [{id,name}]
     this._snapshots = []
 
     // json-rpc plumbing
     this._nextId = 1
     this._pending = new Map()
     this._rxBuffer = ''
+    this._outboundQueue = [] // queue RPCs until handshake completes
+
+    // debug toggle
+    this._wireDebug = true
   }
 
   getConfigFields() {
     return [
-      {
-        type: 'textinput',
-        id: 'host',
-        label: 'VIP-X Host/IP',
-        width: 6,
-        default: '127.0.0.1',
-      },
-      {
-        type: 'number',
-        id: 'port',
-        label: 'TCP Port',
-        width: 3,
-        default: 31001,
-        min: 1,
-        max: 65535,
-      },
+      { type: 'textinput', id: 'host', label: 'VIP-X Host/IP', width: 6, default: '127.0.0.1' },
+      { type: 'number', id: 'port', label: 'TCP Port', width: 3, default: 31001, min: 1, max: 65535 },
     ]
   }
 
   async init(config) {
     this.config = config
     this.updateStatus(InstanceStatus.Connecting)
+
     this.setVariableDefinitions(getVariables())
     this.setFeedbackDefinitions(getFeedbacks(this))
     this._setInitialVariables()
+
     this.initTCP()
     this._rebuildActions()
   }
@@ -76,26 +70,40 @@ class EvertzVIPXInstance extends InstanceBase {
   }
 
   initTCP() {
+    this._handshook = false
+    this._outboundQueue = []
+
     if (this.socket) {
       this.socket.destroy()
       this.socket = undefined
     }
 
     this.socket = new TCPHelper(this.config.host, this.config.port)
+
     this.socket.on('status_change', (status, message) => {
       this.log('debug', `Status: ${status} ${message ?? ''}`)
-      if (status === 'connected') {
+
+      if (status === 'connected' || status === 'ok') {
         this._connected = true
-        this.updateStatus(InstanceStatus.Ok)
-        this.setVariableValues({ connected: 'true' })
-        this.handshake().catch((e) => this.log('error', `Handshake failed: ${e}`))
-      } else if (status === 'disconnected') {
+        // Stay "Connecting" until handshake completes, then set Ok
+        if (!this._handshook) {
+          this.updateStatus(InstanceStatus.Connecting)
+          this.setVariableValues({ connected: 'true' })
+          this._startHandshakeIfNeeded('status_change')
+        }
+        return
+      }
+
+      if (status === 'disconnected') {
         this._connected = false
+        this._handshook = false
+        this._outboundQueue = []
         this.updateStatus(InstanceStatus.Disconnected)
         this.setVariableValues({ connected: 'false', handshake_version: '' })
       } else if (status === 'connecting') {
         this.updateStatus(InstanceStatus.Connecting)
       }
+
       this.checkFeedbacks('connected')
     })
 
@@ -103,14 +111,24 @@ class EvertzVIPXInstance extends InstanceBase {
     this.socket.on('error', (err) => this.log('error', String(err)))
   }
 
-  // --- JSON-RPC helpers ---
+  // ---------------- JSON-RPC helpers ----------------
 
   _sendRaw(obj) {
     const payload = JSON.stringify(obj) + '\r\n'
+    if (this._wireDebug) this.log('debug', `→ ${payload.trimEnd()}`)
     this.socket?.send(payload)
   }
 
   async rpc(method, params = undefined) {
+    // Gate all non-handshake RPCs until handshake completes
+    if (!this._handshook && method !== 'handshake') {
+      return new Promise((resolve, reject) => {
+        this._outboundQueue.push({ method, params, resolve, reject })
+        // Best effort: if we somehow haven't started handshake yet, kick it off
+        this._startHandshakeIfNeeded('rpc_gate')
+      })
+    }
+
     const id = this._nextId++
     const req = { jsonrpc: '2.0', id, method }
     if (params !== undefined) req.params = params
@@ -118,26 +136,62 @@ class EvertzVIPXInstance extends InstanceBase {
     return new Promise((resolve, reject) => {
       this._pending.set(id, { resolve, reject, method })
       this._sendRaw(req)
-      // (Optional) timeout
-      setTimeout(() => {
+
+      const t = setTimeout(() => {
         if (this._pending.has(id)) {
           this._pending.delete(id)
           reject(new Error(`RPC timeout: ${method}`))
         }
-      }, 5000)
+      }, 7000)
+
+      this._pending.get(id).timer = t
     })
   }
 
-  async handshake() {
-    // Per spec, must be first message from client
-    const res = await this.rpc('handshake', { client_supported_versions: [1] })
-    const ver = res?.server_selected_version ?? res?.result?.server_selected_version ?? res?.serverSelectedVersion
-    this._ifaceVersion = ver ?? 1
-    this.setVariableValues({ handshake_version: String(this._ifaceVersion) })
-    this.log('info', `Handshake OK. Using interface version ${this._ifaceVersion}`)
+  _startHandshakeIfNeeded(origin) {
+    if (this._handshook) return
+    if (!this._connected) return
+    // Avoid multiple concurrent calls
+    if (this._startingHandshake) return
+    this._startingHandshake = true
 
-    // prime caches
-    await this.refreshAll().catch((e) => this.log('error', `Initial refresh failed: ${e}`))
+    this.handshake()
+      .catch((e) => {
+        this.log('error', `Handshake failed (${origin}): ${e && e.message ? e.message : e}`)
+        this.updateStatus(InstanceStatus.ConnectionFailure, e?.message || 'Handshake failed')
+      })
+      .finally(() => {
+        this._startingHandshake = false
+      })
+  }
+
+  async handshake() {
+    // Must be the FIRST client message after TCP open (spec)
+    const res = await this.rpc('handshake', { client_supported_versions: [1, 2] })
+
+    const negotiated =
+      res?.result?.server_selected_version ??
+      res?.server_selected_version ??
+      1
+
+    this._ifaceVersion = negotiated
+    this._handshook = true
+
+    this.setVariableValues({ handshake_version: String(negotiated) })
+    this.log('info', `Handshake OK. Using interface version ${negotiated}`)
+
+    // Now we're officially connected
+    this.updateStatus(InstanceStatus.Ok)
+
+    // Flush any queued RPCs (preserving order)
+    const queue = this._outboundQueue
+    this._outboundQueue = []
+    for (const item of queue) {
+      this.rpc(item.method, item.params).then(item.resolve).catch(item.reject)
+    }
+
+    // Prime lists
+    await this.refreshAll().catch((e) => this.log('error', `Initial refresh failed: ${e && e.message ? e.message : e}`))
   }
 
   async refreshAll() {
@@ -148,12 +202,10 @@ class EvertzVIPXInstance extends InstanceBase {
         this.rpc('get_snapshots'),
       ])
 
-      // Normalized extraction (VIP-X replies with {result:{...}})
       this._displays = (displays.result?.displays ?? displays.displays) || []
       this._layouts = (layouts.result?.layouts ?? layouts.layouts) || []
       this._snapshots = (snaps.result?.snapshots ?? snaps.snapshots) || []
 
-      // windows/inputs mapped per display (best-effort fetch)
       for (const d of this._displays) {
         const wid = await this.rpc('get_windows', { display: { id: d.id } }).catch(() => ({}))
         const iid = await this.rpc('get_display_inputs', { display: { id: d.id } }).catch(() => ({}))
@@ -163,20 +215,26 @@ class EvertzVIPXInstance extends InstanceBase {
 
       this._rebuildActions()
       this.checkFeedbacks()
-      this.log('debug', `Refreshed: displays=${this._displays.length}, layouts=${this._layouts.length}, snapshots=${this._snapshots.length}`)
+      this.log('debug', `Refreshed lists — displays=${this._displays.length}, layouts=${this._layouts.length}, snapshots=${this._snapshots.length}`)
     } catch (e) {
-      this.log('error', `Refresh error: ${e}`)
+      this.log('error', `Refresh error: ${e && e.message ? e.message : e}`)
       throw e
     }
   }
 
   _onData(chunk) {
+    // If we get data before we fired handshake (some stacks do this), kick off handshake
+    if (!this._handshook) this._startHandshakeIfNeeded('first_data')
+
     this._rxBuffer += chunk.toString('utf8')
+
     let idx
     while ((idx = this._rxBuffer.indexOf('\r\n')) >= 0) {
       const line = this._rxBuffer.slice(0, idx)
       this._rxBuffer = this._rxBuffer.slice(idx + 2)
       if (!line.trim()) continue
+
+      if (this._wireDebug) this.log('debug', `← ${line}`)
 
       let msg
       try {
@@ -186,7 +244,7 @@ class EvertzVIPXInstance extends InstanceBase {
         continue
       }
 
-      // Server may send requests (ping, notifications)
+      // Server can send requests (ping, notifications)
       if (msg.method) {
         this._handleServerRequest(msg)
         continue
@@ -197,10 +255,11 @@ class EvertzVIPXInstance extends InstanceBase {
         const pending = this._pending.get(msg.id)
         if (pending) {
           this._pending.delete(msg.id)
+          clearTimeout(pending.timer)
           if (msg.error) {
             pending.reject(new Error(`${pending.method} -> ${msg.error.message || 'error'}`))
           } else {
-            pending.resolve(msg.result ?? msg)
+            pending.resolve(msg) // resolve with FULL response object
           }
         }
       }
@@ -208,13 +267,14 @@ class EvertzVIPXInstance extends InstanceBase {
   }
 
   _handleServerRequest(req) {
-    // Reply to ping
+    // VIP-X sends ping periodically; ignore until AFTER handshake, then reply with pong
     if (req.method === 'ping' && typeof req.id !== 'undefined') {
+      if (!this._handshook) return
       this._sendRaw({ jsonrpc: '2.0', id: req.id, result: 'pong' })
       return
     }
 
-    // Notifications: keep local caches in sync
+    // Notifications keep our caches in sync
     switch (req.method) {
       case 'notify_create_snapshot':
       case 'notify_modify_snapshot':
@@ -263,12 +323,12 @@ class EvertzVIPXInstance extends InstanceBase {
             const i = this._displays.findIndex((d) => d.id === display.id)
             if (i >= 0) this._displays[i] = display
             else this._displays.push(display)
-            // lazily refresh child lists for this display
+            // lazily refresh child lists
             this.rpc('get_windows', { display: { id: display.id } })
               .then((w) => (this._windows[display.id] = w.result?.windows ?? w.windows ?? []))
               .catch(() => {})
             this.rpc('get_display_inputs', { display: { id: display.id } })
-              .then((i) => (this._inputs[display.id] = i.result?.inputs ?? i.inputs ?? []))
+              .then((i2) => (this._inputs[display.id] = i2.result?.inputs ?? i2.inputs ?? []))
               .catch(() => {})
           }
           this._rebuildActions()
@@ -276,9 +336,7 @@ class EvertzVIPXInstance extends InstanceBase {
         break
       }
 
-      // We could also ingest set_window_input/audio, set_display_layout notifications if needed
       default:
-        // no-op
         break
     }
   }

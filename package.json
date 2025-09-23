@@ -1,7 +1,7 @@
 {
   "name": "companion-module-evertz-vipx",
   "version": "1.0.0",
-  "description": "Bitfocus Companion module for Evertz VIP-X Multiviewer (JSON-RPC 2.0 over TCP): list & load snapshots, manage layouts/windows/inputs.",
+  "description": "Bitfocus Companion module for Evertz VIP-X Multiviewer: list & load snapshots, manage layouts/windows/inputs.",
   "main": "main.js",
   "type": "module",
   "author": "Caleb",
